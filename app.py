@@ -1,3 +1,11 @@
+# ============================
+# 1️⃣ Install dependencies
+# ============================
+!pip install streamlit folium geopy requests streamlit-folium pyngrok
+
+# ============================
+# 2️⃣ Import modules
+# ============================
 import streamlit as st
 import folium
 from folium.plugins import MarkerCluster
@@ -5,29 +13,43 @@ from geopy.geocoders import Nominatim
 import requests
 from streamlit_folium import st_folium
 from geopy.distance import geodesic
+from datetime import datetime, timedelta
+from pyngrok import ngrok
+import os
 
-# -----------------
-# Configurations
-# -----------------
+# ============================
+# 3️⃣ Write Streamlit EV Pathfinder code
+# ============================
+app_code = """
+import streamlit as st
+import folium
+from folium.plugins import MarkerCluster
+from geopy.geocoders import Nominatim
+import requests
+from streamlit_folium import st_folium
+from geopy.distance import geodesic
+from datetime import datetime, timedelta
+
+# ---------------------------
+# Config
+# ---------------------------
 OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
 geolocator = Nominatim(user_agent="ev_routing_app")
+OPENCHARGEMAP_KEY = "931d4ae3-014a-4ac1-8c4c-d1aa244c42de"
 
+# Multiple EV models
 EV_MODELS = {
-    "Tesla Model 3": {"battery": 75, "range": 400},
-    "Nissan Leaf": {"battery": 40, "range": 240},
-    "Hyundai Kona": {"battery": 64, "range": 415},
+    "Nissan Leaf": {"range_km": 240, "fast_rate": 150, "normal_rate": 50},
+    "Tesla Model 3": {"range_km": 350, "fast_rate": 250, "normal_rate": 100},
+    "Hyundai Kona": {"range_km": 300, "fast_rate": 200, "normal_rate": 70},
+    "MG ZS EV": {"range_km": 320, "fast_rate": 180, "normal_rate": 60},
 }
 
-CHARGING_STATIONS = [
-    {"name": "Fast Charger 1", "lat": 12.9716, "lon": 77.5946},
-    {"name": "Fast Charger 2", "lat": 12.9352, "lon": 77.6245},
-    {"name": "Normal Charger", "lat": 12.9141, "lon": 77.6387},
-    {"name": "Charger 4", "lat": 12.8500, "lon": 77.6000},
-]
+AVERAGE_SPEED_KMH = 50
 
-# -----------------
-# Helper Functions
-# -----------------
+# ---------------------------
+# Helper functions
+# ---------------------------
 def geocode_address(address):
     location = geolocator.geocode(address)
     if location:
@@ -47,57 +69,138 @@ def get_route(start_coords, end_coords):
         st.error("Error fetching route from OSRM")
         return []
 
-def suggest_charging_stops(route_coords, ev_range_km):
-    stops = []
-    distance_covered = 0
-    for i in range(1, len(route_coords)):
-        distance_covered += geodesic(route_coords[i-1], route_coords[i]).km
-        if distance_covered >= ev_range_km:
-            nearest_cs = min(CHARGING_STATIONS, key=lambda cs: geodesic((cs["lat"], cs["lon"]), route_coords[i]).km)
-            stops.append(nearest_cs)
-            distance_covered = 0
-    return stops
+def get_charging_stations(lat, lon, radius_m=10000, maxresults=50):
+    url = f"https://api.openchargemap.io/v3/poi/?output=json&latitude={lat}&longitude={lon}&distance={radius_m/1000}&maxresults={maxresults}"
+    headers = {"X-API-Key": OPENCHARGEMAP_KEY}
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    else:
+        st.error("Error fetching charging stations")
+        return []
 
-# -----------------
+def estimate_travel_time(distance_km, avg_speed_kmh=AVERAGE_SPEED_KMH):
+    return distance_km / avg_speed_kmh
+
+def estimate_charging_time(distance_needed, charger_rate):
+    return distance_needed / charger_rate
+
+# ---------------------------
+# Smart charging stop selection
+# ---------------------------
+def get_optimal_charging_stop(lat, lon, ev_range_km, radius_m=5000):
+    stations = get_charging_stations(lat, lon, radius_m=radius_m, maxresults=20)
+    if not stations:
+        return None, "Normal", 0
+    best_score = -1
+    best_station = None
+    charger_type = "Normal"
+    for cs in stations:
+        level = cs.get("Connections", [{}])[0].get("Level", {})
+        if level and "LevelID" in level:
+            if level["LevelID"] == 3:
+                rate = 150
+                c_type = "Fast"
+            else:
+                rate = 50
+                c_type = "Normal"
+        else:
+            rate = 50
+            c_type = "Normal"
+        cs_lat = cs["AddressInfo"]["Latitude"]
+        cs_lon = cs["AddressInfo"]["Longitude"]
+        distance = geodesic((lat, lon), (cs_lat, cs_lon)).km
+        score = rate / (distance + 0.1)
+        if score > best_score:
+            best_score = score
+            best_station = cs
+            charger_type = c_type
+    charge_time = estimate_charging_time(ev_range_km, rate)
+    return best_station, charger_type, charge_time
+
+def calculate_eta_for_all_optimal(route_coords):
+    eta_dict = {}
+    for ev_name, ev in EV_MODELS.items():
+        eta_list = []
+        now = datetime.now()
+        distance_since_last_charge = 0
+        for i in range(1, len(route_coords)):
+            segment_distance = geodesic(route_coords[i-1], route_coords[i]).km
+            distance_since_last_charge += segment_distance
+            travel_time = estimate_travel_time(segment_distance)
+            now += timedelta(hours=travel_time)
+            if distance_since_last_charge >= ev["range_km"]:
+                best_charger, charger_type, charge_time = get_optimal_charging_stop(*route_coords[i], ev["range_km"])
+                eta_list.append((route_coords[i], now, charger_type, charge_time, best_charger))
+                distance_since_last_charge = 0
+        eta_list.append((route_coords[-1], now, "None", 0, None))
+        eta_dict[ev_name] = eta_list
+    return eta_dict
+
+# ---------------------------
 # Streamlit UI
-# -----------------
-st.set_page_config(page_title="⚡ Smart EV Navigator", layout="wide")
-st.title("⚡ Smart EV Navigator")
+# ---------------------------
+st.set_page_config(page_title="⚡ Smart EV Pathfinder", layout="wide")
+st.title("⚡ Smart EV Pathfinder - Optimal Charging Stops & ETA")
 
 st.sidebar.header("Trip Details")
 start_addr = st.sidebar.text_input("Start Location", "Bangalore")
 end_addr = st.sidebar.text_input("Destination", "Mysore")
-ev_choice = st.sidebar.selectbox("Select Your EV", list(EV_MODELS.keys()))
-
-if "route_coords" not in st.session_state:
-    st.session_state.route_coords = None
-if "charging_stops" not in st.session_state:
-    st.session_state.charging_stops = None
 
 if st.sidebar.button("Start Trip"):
     start_coords = geocode_address(start_addr)
     end_coords = geocode_address(end_addr)
-
     if start_coords and end_coords:
-        st.session_state.route_coords = get_route(start_coords, end_coords)
-        ev_range = EV_MODELS[ev_choice]["range"]
-        st.session_state.charging_stops = suggest_charging_stops(st.session_state.route_coords, ev_range)
+        route_coords = get_route(start_coords, end_coords)
+        charging_stations = get_charging_stations(
+            lat=(start_coords[0]+end_coords[0])/2,
+            lon=(start_coords[1]+end_coords[1])/2,
+            radius_m=50000,
+            maxresults=100
+        )
+        eta_all = calculate_eta_for_all_optimal(route_coords)
 
-# Display Map only if route exists
-if st.session_state.route_coords:
-    m = folium.Map(location=st.session_state.route_coords[0], zoom_start=10)
-    folium.PolyLine(st.session_state.route_coords, color="blue", weight=5).add_to(m)
-    folium.Marker(st.session_state.route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker(st.session_state.route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
+        # Map
+        m = folium.Map(location=route_coords[0], zoom_start=10)
+        folium.PolyLine(route_coords, color="blue", weight=5).add_to(m)
+        folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
+        folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
 
-    marker_cluster = MarkerCluster().add_to(m)
-    for cs in CHARGING_STATIONS:
-        folium.Marker([cs["lat"], cs["lon"]], popup=cs["name"], icon=folium.Icon(color="orange")).add_to(marker_cluster)
+        # Charging stations
+        if charging_stations:
+            marker_cluster = MarkerCluster().add_to(m)
+            for cs in charging_stations:
+                lat = cs["AddressInfo"]["Latitude"]
+                lon = cs["AddressInfo"]["Longitude"]
+                name = cs["AddressInfo"]["Title"]
+                folium.Marker([lat, lon], popup=name, icon=folium.Icon(color="orange")).add_to(marker_cluster)
 
-    for stop in st.session_state.charging_stops:
-        folium.Marker([stop["lat"], stop["lon"]],
-                      popup=f"Suggested Stop: {stop['name']}",
-                      icon=folium.Icon(color="purple", icon="bolt", prefix='fa')).add_to(m)
+        st.subheader("EV Route with Optimal Charging Stops")
+        st_folium(m, width=800, height=600)
 
-    st.subheader("Optimal EV Route with Charging Stops")
-    st_folium(m, width=800, height=600)
+        # Display ETA for all EVs
+        for ev_name, eta_info in eta_all.items():
+            st.sidebar.subheader(f"{ev_name} ETA")
+            for stop_coords, eta, charger_type, charge_time, charger in eta_info:
+                if charger_type != "None":
+                    charger_name = charger["AddressInfo"]["Title"] if charger else "Unknown"
+                    st.sidebar.markdown(f"{charger_name}: {charger_type} Stop at {eta.strftime('%H:%M')} ({charge_time:.1f} hrs)")
+            st.sidebar.markdown(f"**Destination ETA:** {eta_info[-1][1].strftime('%H:%M')}")
+"""
+
+with open("smart_ev_pathfinder.py", "w") as f:
+    f.write(app_code)
+
+# ============================
+# 4️⃣ Setup ngrok
+# ============================
+NGROK_AUTHTOKEN = "YOUR_NGROK_V2_AUTHTOKEN"  # <--- Replace with your ngrok v2 token
+!ngrok authtoken {NGROK_AUTHTOKEN}
+ngrok.kill()
+public_url = ngrok.connect(8501)
+print(f"Open your Smart EV Pathfinder app here: {public_url}")
+
+# ============================
+# 5️⃣ Run Streamlit app
+# ============================
+get_ipython().system_raw("streamlit run smart_ev_pathfinder.py &")
