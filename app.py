@@ -1,26 +1,3 @@
-# ============================
-# 1️⃣ Install dependencies
-# ============================
-!pip install streamlit folium geopy requests streamlit-folium pyngrok
-
-# ============================
-# 2️⃣ Import modules
-# ============================
-import streamlit as st
-import folium
-from folium.plugins import MarkerCluster
-from geopy.geocoders import Nominatim
-import requests
-from streamlit_folium import st_folium
-from geopy.distance import geodesic
-from datetime import datetime, timedelta
-from pyngrok import ngrok
-import os
-
-# ============================
-# 3️⃣ Write Streamlit EV Pathfinder code
-# ============================
-app_code = """
 import streamlit as st
 import folium
 from folium.plugins import MarkerCluster
@@ -37,7 +14,7 @@ OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
 geolocator = Nominatim(user_agent="ev_routing_app")
 OPENCHARGEMAP_KEY = "931d4ae3-014a-4ac1-8c4c-d1aa244c42de"
 
-# Multiple EV models
+# EV models (all included)
 EV_MODELS = {
     "Nissan Leaf": {"range_km": 240, "fast_rate": 150, "normal_rate": 50},
     "Tesla Model 3": {"range_km": 350, "fast_rate": 250, "normal_rate": 100},
@@ -186,21 +163,3 @@ if st.sidebar.button("Start Trip"):
                     charger_name = charger["AddressInfo"]["Title"] if charger else "Unknown"
                     st.sidebar.markdown(f"{charger_name}: {charger_type} Stop at {eta.strftime('%H:%M')} ({charge_time:.1f} hrs)")
             st.sidebar.markdown(f"**Destination ETA:** {eta_info[-1][1].strftime('%H:%M')}")
-"""
-
-with open("smart_ev_pathfinder.py", "w") as f:
-    f.write(app_code)
-
-# ============================
-# 4️⃣ Setup ngrok
-# ============================
-NGROK_AUTHTOKEN = "YOUR_NGROK_V2_AUTHTOKEN"  # <--- Replace with your ngrok v2 token
-!ngrok authtoken {NGROK_AUTHTOKEN}
-ngrok.kill()
-public_url = ngrok.connect(8501)
-print(f"Open your Smart EV Pathfinder app here: {public_url}")
-
-# ============================
-# 5️⃣ Run Streamlit app
-# ============================
-get_ipython().system_raw("streamlit run smart_ev_pathfinder.py &")
