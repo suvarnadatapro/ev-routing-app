@@ -5,7 +5,7 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 import requests
 from datetime import datetime, timedelta
-from streamlit_folium import st_folium
+from streamlit_folium import folium_static
 
 # ---------------------------
 # Config
@@ -19,24 +19,24 @@ AVERAGE_SPEED_KMH = 50
 LOW_BATTERY_THRESHOLD = 0.25  # 25%
 
 st.set_page_config(page_title="⚡ SmartEV Navigator", layout="wide")
-st.title("⚡ SmartEV Navigator")  # New shorter name
+st.title("⚡ SmartEV Navigator")
 
 # ---------------------------
-# Caching expensive calls
+# Cache expensive operations
 # ---------------------------
 @st.cache_data
 def geocode_address(address):
-    location = geolocator.geocode(address)
-    if location:
-        return (location.latitude, location.longitude)
+    loc = geolocator.geocode(address)
+    if loc:
+        return (loc.latitude, loc.longitude)
     return None
 
 @st.cache_data
 def get_route(start_coords, end_coords):
     url = f"{OSRM_URL}/{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}?overview=full&geometries=geojson"
-    response = requests.get(url)
-    if response.status_code == 200:
-        data = response.json()
+    r = requests.get(url)
+    if r.status_code == 200:
+        data = r.json()
         return [(pt[1], pt[0]) for pt in data["routes"][0]["geometry"]["coordinates"]]
     return []
 
@@ -44,9 +44,9 @@ def get_route(start_coords, end_coords):
 def get_charging_stations(lat, lon, radius_m=10000, maxresults=50):
     url = f"https://api.openchargemap.io/v3/poi/?output=json&latitude={lat}&longitude={lon}&distance={radius_m/1000}&maxresults={maxresults}"
     headers = {"X-API-Key": OPENCHARGEMAP_KEY}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.json()
     return []
 
 # ---------------------------
@@ -91,39 +91,62 @@ def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
 # ---------------------------
 start_addr = st.sidebar.text_input("Start Location", "Bangalore")
 end_addr = st.sidebar.text_input("Destination", "Mysore")
+plan_btn = st.sidebar.button("Plan Trip")
 
 # ---------------------------
-# Session state for map persistence
+# Session state to store data only
 # ---------------------------
-if "map_data" not in st.session_state:
-    st.session_state.map_data = None
+if "route_coords" not in st.session_state:
+    st.session_state.route_coords = None
+    st.session_state.segments = None
+    st.session_state.charging_points = None
     st.session_state.start_addr = None
     st.session_state.end_addr = None
 
-def build_map(start_addr, end_addr):
+# ---------------------------
+# Build route & charging data
+# ---------------------------
+if plan_btn or st.session_state.route_coords is None \
+   or st.session_state.start_addr != start_addr \
+   or st.session_state.end_addr != end_addr:
+
+    st.session_state.start_addr = start_addr
+    st.session_state.end_addr = end_addr
+
     start_coords = geocode_address(start_addr)
     end_coords = geocode_address(end_addr)
+
     if not start_coords or not end_coords:
         st.error("Invalid start or end location!")
-        return None
+    else:
+        route_coords = get_route(start_coords, end_coords)
+        if not route_coords:
+            st.error("Unable to fetch route.")
+        else:
+            segments, charging_points = battery_route_segments(route_coords)
+            st.session_state.route_coords = route_coords
+            st.session_state.segments = segments
+            st.session_state.charging_points = charging_points
 
-    route_coords = get_route(start_coords, end_coords)
-    if not route_coords:
-        st.error("Unable to fetch route.")
-        return None
+# ---------------------------
+# Build and display map
+# ---------------------------
+if st.session_state.route_coords and st.session_state.segments:
+    start_coords = st.session_state.route_coords[0]
+    m = folium.Map(location=start_coords, zoom_start=10)
 
-    segments, charging_points = battery_route_segments(route_coords)
+    # Start & end markers
+    folium.Marker(start_coords, popup="Start", icon=folium.Icon(color="green")).add_to(m)
+    folium.Marker(st.session_state.route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
 
-    m = folium.Map(location=route_coords[0], zoom_start=10)
-    folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
-    folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
-
-    for start, end, color in segments:
+    # Route segments
+    for start, end, color in st.session_state.segments:
         folium.PolyLine([start, end], color=color, weight=5).add_to(m)
 
-    if charging_points:
+    # Suggested charging points
+    if st.session_state.charging_points:
         cluster = MarkerCluster().add_to(m)
-        for charger, eta in charging_points:
+        for charger, eta in st.session_state.charging_points:
             lat = charger["AddressInfo"]["Latitude"]
             lon = charger["AddressInfo"]["Longitude"]
             name = charger["AddressInfo"]["Title"]
@@ -131,10 +154,10 @@ def build_map(start_addr, end_addr):
                           popup=f"{name}\nETA: {eta.strftime('%H:%M')}",
                           icon=folium.Icon(color="red", icon="bolt", prefix="fa")).add_to(cluster)
 
-    # Add other nearby chargers
-    all_stations = get_charging_stations((start_coords[0]+end_coords[0])/2,
-                                         (start_coords[1]+end_coords[1])/2,
-                                         radius_m=50000, maxresults=100)
+    # Nearby chargers along route
+    mid_lat = (st.session_state.route_coords[0][0] + st.session_state.route_coords[-1][0])/2
+    mid_lon = (st.session_state.route_coords[0][1] + st.session_state.route_coords[-1][1])/2
+    all_stations = get_charging_stations(mid_lat, mid_lon, radius_m=50000, maxresults=100)
     if all_stations:
         cluster = MarkerCluster().add_to(m)
         for cs in all_stations:
@@ -162,23 +185,5 @@ def build_map(start_addr, end_addr):
     """
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    return m
-
-# ---------------------------
-# Build map on button click only
-# ---------------------------
-if st.sidebar.button("Plan Trip") or st.session_state.map_data is None \
-        or st.session_state.start_addr != start_addr \
-        or st.session_state.end_addr != end_addr:
-
-    st.session_state.start_addr = start_addr
-    st.session_state.end_addr = end_addr
-    st.session_state.map_data = build_map(start_addr, end_addr)
-
-# ---------------------------
-# Display the map
-# ---------------------------
-if st.session_state.map_data:
-    st.subheader("EV Route with Smart Charging & ETA")
-    st_folium(st.session_state.map_data, width=900, height=600)
-
+    # Use folium_static to render the map permanently
+    folium_static(m, width=900, height=600)
