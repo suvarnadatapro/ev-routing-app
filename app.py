@@ -62,9 +62,6 @@ def find_nearest_charger(lat, lon):
     eta = datetime.now() + timedelta(hours=estimate_travel_time(distance))
     return nearest, eta
 
-# ---------------------------
-# Battery-aware route and charging
-# ---------------------------
 def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
     segments = []
     remaining_km = ev_range_km
@@ -75,11 +72,10 @@ def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
         seg_distance = geodesic(start, end).km
         remaining_km -= seg_distance
         if remaining_km <= 0:
-            # Low battery → suggest nearest charger
             charger, eta = find_nearest_charger(*end)
             if charger:
                 charging_points.append((charger, eta))
-                remaining_km = ev_range_km  # reset after charging
+                remaining_km = ev_range_km
             color = "red"
         elif remaining_km <= ev_range_km * LOW_BATTERY_THRESHOLD:
             color = "orange"
@@ -91,24 +87,36 @@ def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.set_page_config(page_title="⚡ EV Smart Navigator", layout="wide")
-st.title("⚡ EV Smart Navigator")
+st.set_page_config(page_title="⚡ EV Pathfinder", layout="wide")
+st.title("⚡ EV Pathfinder")
 
 st.sidebar.header("Trip Details")
 start_addr = st.sidebar.text_input("Start Location", "Bangalore")
 end_addr = st.sidebar.text_input("Destination", "Mysore")
 
+# ---------------------------
+# Session state for persistence
+# ---------------------------
 if "map_data" not in st.session_state:
     st.session_state.map_data = None
+    st.session_state.start_addr = None
+    st.session_state.end_addr = None
 
-if st.sidebar.button("Start Trip"):
+# Recompute map only if inputs change or button pressed
+if st.sidebar.button("Start Trip") or st.session_state.map_data is None \
+        or st.session_state.start_addr != start_addr \
+        or st.session_state.end_addr != end_addr:
+
+    st.session_state.start_addr = start_addr
+    st.session_state.end_addr = end_addr
+
     start_coords = geocode_address(start_addr)
     end_coords = geocode_address(end_addr)
+
     if start_coords and end_coords:
         route_coords = get_route(start_coords, end_coords)
         segments, charging_points = battery_route_segments(route_coords)
 
-        # Map
         m = folium.Map(location=route_coords[0], zoom_start=10)
         folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
         folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
@@ -117,7 +125,7 @@ if st.sidebar.button("Start Trip"):
         for start, end, color in segments:
             folium.PolyLine([start, end], color=color, weight=5).add_to(m)
 
-        # Add charging points
+        # Add suggested charging stops
         if charging_points:
             marker_cluster = MarkerCluster().add_to(m)
             for charger, eta in charging_points:
@@ -169,6 +177,7 @@ if st.sidebar.button("Start Trip"):
         m.get_root().html.add_child(folium.Element(legend_html))
         st.session_state.map_data = m
 
+# Display the map
 if st.session_state.map_data:
     st.subheader("EV Route with Smart Charging & ETA")
     st_folium(st.session_state.map_data, width=900, height=600)
