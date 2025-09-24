@@ -11,24 +11,28 @@ from datetime import datetime, timedelta
 # Config
 # ---------------------------
 OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
-geolocator = Nominatim(user_agent="ev_routing_app")
+geolocator = Nominatim(user_agent="smart_ev_navigator")
 OPENCHARGEMAP_KEY = "931d4ae3-014a-4ac1-8c4c-d1aa244c42de"
 
 DEFAULT_EV_RANGE_KM = 300
 AVERAGE_SPEED_KMH = 50
-LOW_BATTERY_THRESHOLD = 0.25  # 25% remaining
+LOW_BATTERY_THRESHOLD = 0.25  # 25%
+
+st.set_page_config(page_title="⚡ SmartEV Navigator", layout="wide")
+st.title("⚡ SmartEV Navigator")
 
 # ---------------------------
-# Helper functions
+# Caching API calls for persistence
 # ---------------------------
+@st.cache_data
 def geocode_address(address):
     location = geolocator.geocode(address)
     if location:
         return (location.latitude, location.longitude)
     else:
-        st.error(f"Address '{address}' not found!")
         return None
 
+@st.cache_data
 def get_route(start_coords, end_coords):
     url = f"{OSRM_URL}/{start_coords[1]},{start_coords[0]};{end_coords[1]},{end_coords[0]}?overview=full&geometries=geojson"
     response = requests.get(url)
@@ -36,19 +40,16 @@ def get_route(start_coords, end_coords):
         data = response.json()
         coords = [(pt[1], pt[0]) for pt in data["routes"][0]["geometry"]["coordinates"]]
         return coords
-    else:
-        st.error("Error fetching route from OSRM")
-        return []
+    return []
 
+@st.cache_data
 def get_charging_stations(lat, lon, radius_m=10000, maxresults=50):
     url = f"https://api.openchargemap.io/v3/poi/?output=json&latitude={lat}&longitude={lon}&distance={radius_m/1000}&maxresults={maxresults}"
     headers = {"X-API-Key": OPENCHARGEMAP_KEY}
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
         return response.json()
-    else:
-        st.error("Error fetching charging stations")
-        return []
+    return []
 
 def estimate_travel_time(distance_km):
     return distance_km / AVERAGE_SPEED_KMH
@@ -85,30 +86,12 @@ def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
     return segments, charging_points
 
 # ---------------------------
-# Streamlit UI
+# Sidebar inputs
 # ---------------------------
-st.set_page_config(page_title="⚡ EV Pathfinder", layout="wide")
-st.title("⚡ EV Pathfinder")
-
-st.sidebar.header("Trip Details")
 start_addr = st.sidebar.text_input("Start Location", "Bangalore")
 end_addr = st.sidebar.text_input("Destination", "Mysore")
 
-# ---------------------------
-# Session state for persistence
-# ---------------------------
-if "map_data" not in st.session_state:
-    st.session_state.map_data = None
-    st.session_state.start_addr = None
-    st.session_state.end_addr = None
-
-# Recompute map only if inputs change or button pressed
-if st.sidebar.button("Start Trip") or st.session_state.map_data is None \
-        or st.session_state.start_addr != start_addr \
-        or st.session_state.end_addr != end_addr:
-
-    st.session_state.start_addr = start_addr
-    st.session_state.end_addr = end_addr
+if st.sidebar.button("Plan Trip"):
 
     start_coords = geocode_address(start_addr)
     end_coords = geocode_address(end_addr)
@@ -117,15 +100,18 @@ if st.sidebar.button("Start Trip") or st.session_state.map_data is None \
         route_coords = get_route(start_coords, end_coords)
         segments, charging_points = battery_route_segments(route_coords)
 
+        # ---------------------------
+        # Build map only once
+        # ---------------------------
         m = folium.Map(location=route_coords[0], zoom_start=10)
         folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
         folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
 
-        # Draw battery-aware route
+        # Draw route segments
         for start, end, color in segments:
             folium.PolyLine([start, end], color=color, weight=5).add_to(m)
 
-        # Add suggested charging stops
+        # Suggested charging points
         if charging_points:
             marker_cluster = MarkerCluster().add_to(m)
             for charger, eta in charging_points:
@@ -138,7 +124,7 @@ if st.sidebar.button("Start Trip") or st.session_state.map_data is None \
                     icon=folium.Icon(color="red", icon="bolt", prefix="fa")
                 ).add_to(marker_cluster)
 
-        # Add other nearby chargers
+        # Nearby chargers
         all_stations = get_charging_stations(
             lat=(start_coords[0]+end_coords[0])/2,
             lon=(start_coords[1]+end_coords[1])/2,
@@ -175,9 +161,11 @@ if st.sidebar.button("Start Trip") or st.session_state.map_data is None \
         </div>
         """
         m.get_root().html.add_child(folium.Element(legend_html))
+
+        # Save map in session_state to prevent disappearing
         st.session_state.map_data = m
 
 # Display the map
-if st.session_state.map_data:
+if "map_data" in st.session_state and st.session_state.map_data:
     st.subheader("EV Route with Smart Charging & ETA")
     st_folium(st.session_state.map_data, width=900, height=600)
