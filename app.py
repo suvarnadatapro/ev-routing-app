@@ -14,15 +14,9 @@ OSRM_URL = "http://router.project-osrm.org/route/v1/driving"
 geolocator = Nominatim(user_agent="ev_routing_app")
 OPENCHARGEMAP_KEY = "931d4ae3-014a-4ac1-8c4c-d1aa244c42de"
 
-# EV models (all included)
-EV_MODELS = {
-    "Nissan Leaf": {"range_km": 240, "fast_rate": 150, "normal_rate": 50},
-    "Tesla Model 3": {"range_km": 350, "fast_rate": 250, "normal_rate": 100},
-    "Hyundai Kona": {"range_km": 300, "fast_rate": 200, "normal_rate": 70},
-    "MG ZS EV": {"range_km": 320, "fast_rate": 180, "normal_rate": 60},
-}
-
+DEFAULT_EV_RANGE_KM = 300
 AVERAGE_SPEED_KMH = 50
+LOW_BATTERY_THRESHOLD = 0.25  # 25% remaining
 
 # ---------------------------
 # Helper functions
@@ -56,110 +50,125 @@ def get_charging_stations(lat, lon, radius_m=10000, maxresults=50):
         st.error("Error fetching charging stations")
         return []
 
-def estimate_travel_time(distance_km, avg_speed_kmh=AVERAGE_SPEED_KMH):
-    return distance_km / avg_speed_kmh
+def estimate_travel_time(distance_km):
+    return distance_km / AVERAGE_SPEED_KMH
 
-def estimate_charging_time(distance_needed, charger_rate):
-    return distance_needed / charger_rate
-
-# ---------------------------
-# Smart charging stop selection
-# ---------------------------
-def get_optimal_charging_stop(lat, lon, ev_range_km, radius_m=5000):
-    stations = get_charging_stations(lat, lon, radius_m=radius_m, maxresults=20)
+def find_nearest_charger(lat, lon):
+    stations = get_charging_stations(lat, lon, radius_m=5000, maxresults=20)
     if not stations:
-        return None, "Normal", 0
-    best_score = -1
-    best_station = None
-    charger_type = "Normal"
-    for cs in stations:
-        level = cs.get("Connections", [{}])[0].get("Level", {})
-        if level and "LevelID" in level:
-            if level["LevelID"] == 3:
-                rate = 150
-                c_type = "Fast"
-            else:
-                rate = 50
-                c_type = "Normal"
-        else:
-            rate = 50
-            c_type = "Normal"
-        cs_lat = cs["AddressInfo"]["Latitude"]
-        cs_lon = cs["AddressInfo"]["Longitude"]
-        distance = geodesic((lat, lon), (cs_lat, cs_lon)).km
-        score = rate / (distance + 0.1)
-        if score > best_score:
-            best_score = score
-            best_station = cs
-            charger_type = c_type
-    charge_time = estimate_charging_time(ev_range_km, rate)
-    return best_station, charger_type, charge_time
+        return None, None
+    nearest = min(stations, key=lambda x: geodesic((lat, lon), (x["AddressInfo"]["Latitude"], x["AddressInfo"]["Longitude"])).km)
+    distance = geodesic((lat, lon), (nearest["AddressInfo"]["Latitude"], nearest["AddressInfo"]["Longitude"])).km
+    eta = datetime.now() + timedelta(hours=estimate_travel_time(distance))
+    return nearest, eta
 
-def calculate_eta_for_all_optimal(route_coords):
-    eta_dict = {}
-    for ev_name, ev in EV_MODELS.items():
-        eta_list = []
-        now = datetime.now()
-        distance_since_last_charge = 0
-        for i in range(1, len(route_coords)):
-            segment_distance = geodesic(route_coords[i-1], route_coords[i]).km
-            distance_since_last_charge += segment_distance
-            travel_time = estimate_travel_time(segment_distance)
-            now += timedelta(hours=travel_time)
-            if distance_since_last_charge >= ev["range_km"]:
-                best_charger, charger_type, charge_time = get_optimal_charging_stop(*route_coords[i], ev["range_km"])
-                eta_list.append((route_coords[i], now, charger_type, charge_time, best_charger))
-                distance_since_last_charge = 0
-        eta_list.append((route_coords[-1], now, "None", 0, None))
-        eta_dict[ev_name] = eta_list
-    return eta_dict
+# ---------------------------
+# Battery-aware route and charging
+# ---------------------------
+def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
+    segments = []
+    remaining_km = ev_range_km
+    charging_points = []
+    for i in range(1, len(route_coords)):
+        start = route_coords[i-1]
+        end = route_coords[i]
+        seg_distance = geodesic(start, end).km
+        remaining_km -= seg_distance
+        if remaining_km <= 0:
+            # Low battery → suggest nearest charger
+            charger, eta = find_nearest_charger(*end)
+            if charger:
+                charging_points.append((charger, eta))
+                remaining_km = ev_range_km  # reset after charging
+            color = "red"
+        elif remaining_km <= ev_range_km * LOW_BATTERY_THRESHOLD:
+            color = "orange"
+        else:
+            color = "green"
+        segments.append((start, end, color))
+    return segments, charging_points
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.set_page_config(page_title="⚡ Smart EV Pathfinder", layout="wide")
-st.title("⚡ Smart EV Pathfinder - Optimal Charging Stops & ETA")
+st.set_page_config(page_title="⚡ EV Smart Navigator", layout="wide")
+st.title("⚡ EV Smart Navigator")
 
 st.sidebar.header("Trip Details")
 start_addr = st.sidebar.text_input("Start Location", "Bangalore")
 end_addr = st.sidebar.text_input("Destination", "Mysore")
+
+if "map_data" not in st.session_state:
+    st.session_state.map_data = None
 
 if st.sidebar.button("Start Trip"):
     start_coords = geocode_address(start_addr)
     end_coords = geocode_address(end_addr)
     if start_coords and end_coords:
         route_coords = get_route(start_coords, end_coords)
-        charging_stations = get_charging_stations(
+        segments, charging_points = battery_route_segments(route_coords)
+
+        # Map
+        m = folium.Map(location=route_coords[0], zoom_start=10)
+        folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
+        folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
+
+        # Draw battery-aware route
+        for start, end, color in segments:
+            folium.PolyLine([start, end], color=color, weight=5).add_to(m)
+
+        # Add charging points
+        if charging_points:
+            marker_cluster = MarkerCluster().add_to(m)
+            for charger, eta in charging_points:
+                lat = charger["AddressInfo"]["Latitude"]
+                lon = charger["AddressInfo"]["Longitude"]
+                name = charger["AddressInfo"]["Title"]
+                folium.Marker(
+                    [lat, lon],
+                    popup=f"{name}\nETA: {eta.strftime('%H:%M')}",
+                    icon=folium.Icon(color="red", icon="bolt", prefix="fa")
+                ).add_to(marker_cluster)
+
+        # Add other nearby chargers
+        all_stations = get_charging_stations(
             lat=(start_coords[0]+end_coords[0])/2,
             lon=(start_coords[1]+end_coords[1])/2,
             radius_m=50000,
             maxresults=100
         )
-        eta_all = calculate_eta_for_all_optimal(route_coords)
-
-        # Map
-        m = folium.Map(location=route_coords[0], zoom_start=10)
-        folium.PolyLine(route_coords, color="blue", weight=5).add_to(m)
-        folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
-        folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
-
-        # Charging stations
-        if charging_stations:
+        if all_stations:
             marker_cluster = MarkerCluster().add_to(m)
-            for cs in charging_stations:
+            for cs in all_stations:
                 lat = cs["AddressInfo"]["Latitude"]
                 lon = cs["AddressInfo"]["Longitude"]
                 name = cs["AddressInfo"]["Title"]
-                folium.Marker([lat, lon], popup=name, icon=folium.Icon(color="orange")).add_to(marker_cluster)
+                folium.Marker(
+                    [lat, lon],
+                    popup=name,
+                    icon=folium.Icon(color="orange", icon="flash", prefix="fa")
+                ).add_to(marker_cluster)
 
-        st.subheader("EV Route with Optimal Charging Stops")
-        st_folium(m, width=800, height=600)
+        # Legend
+        legend_html = """
+        <div style="
+        position: fixed; 
+        bottom: 50px; left: 50px; width: 250px; height: 130px; 
+        border:2px solid grey; z-index:9999; font-size:14px;
+        background-color:white;
+        padding: 10px;
+        ">
+        <b>Legend</b><br>
+        <i style="color:green;">■</i>&nbsp;Sufficient Battery<br>
+        <i style="color:orange;">■</i>&nbsp;Low Battery Warning<br>
+        <i style="color:red;">■</i>&nbsp;Must Charge Now<br>
+        <i class="fa fa-bolt" style="color:red"></i>&nbsp;Suggested Charging Stop<br>
+        <i class="fa fa-plug" style="color:orange"></i>&nbsp;Other Chargers
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+        st.session_state.map_data = m
 
-        # Display ETA for all EVs
-        for ev_name, eta_info in eta_all.items():
-            st.sidebar.subheader(f"{ev_name} ETA")
-            for stop_coords, eta, charger_type, charge_time, charger in eta_info:
-                if charger_type != "None":
-                    charger_name = charger["AddressInfo"]["Title"] if charger else "Unknown"
-                    st.sidebar.markdown(f"{charger_name}: {charger_type} Stop at {eta.strftime('%H:%M')} ({charge_time:.1f} hrs)")
-            st.sidebar.markdown(f"**Destination ETA:** {eta_info[-1][1].strftime('%H:%M')}")
+if st.session_state.map_data:
+    st.subheader("EV Route with Smart Charging & ETA")
+    st_folium(st.session_state.map_data, width=900, height=600)
