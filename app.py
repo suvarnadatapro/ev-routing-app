@@ -2,10 +2,10 @@ import streamlit as st
 import folium
 from folium.plugins import MarkerCluster
 from geopy.geocoders import Nominatim
-import requests
-from streamlit_folium import st_folium
 from geopy.distance import geodesic
+import requests
 from datetime import datetime, timedelta
+from streamlit_folium import st_folium
 
 # ---------------------------
 # Config
@@ -19,18 +19,17 @@ AVERAGE_SPEED_KMH = 50
 LOW_BATTERY_THRESHOLD = 0.25  # 25%
 
 st.set_page_config(page_title="⚡ SmartEV Navigator", layout="wide")
-st.title("⚡ SmartEV Navigator")
+st.title("⚡ SmartEV Navigator")  # New shorter name
 
 # ---------------------------
-# Caching API calls for persistence
+# Caching expensive calls
 # ---------------------------
 @st.cache_data
 def geocode_address(address):
     location = geolocator.geocode(address)
     if location:
         return (location.latitude, location.longitude)
-    else:
-        return None
+    return None
 
 @st.cache_data
 def get_route(start_coords, end_coords):
@@ -38,8 +37,7 @@ def get_route(start_coords, end_coords):
     response = requests.get(url)
     if response.status_code == 200:
         data = response.json()
-        coords = [(pt[1], pt[0]) for pt in data["routes"][0]["geometry"]["coordinates"]]
-        return coords
+        return [(pt[1], pt[0]) for pt in data["routes"][0]["geometry"]["coordinates"]]
     return []
 
 @st.cache_data
@@ -51,6 +49,9 @@ def get_charging_stations(lat, lon, radius_m=10000, maxresults=50):
         return response.json()
     return []
 
+# ---------------------------
+# Helper functions
+# ---------------------------
 def estimate_travel_time(distance_km):
     return distance_km / AVERAGE_SPEED_KMH
 
@@ -86,86 +87,98 @@ def battery_route_segments(route_coords, ev_range_km=DEFAULT_EV_RANGE_KM):
     return segments, charging_points
 
 # ---------------------------
-# Sidebar inputs
+# Sidebar
 # ---------------------------
 start_addr = st.sidebar.text_input("Start Location", "Bangalore")
 end_addr = st.sidebar.text_input("Destination", "Mysore")
 
-if st.sidebar.button("Plan Trip"):
+# ---------------------------
+# Session state for map persistence
+# ---------------------------
+if "map_data" not in st.session_state:
+    st.session_state.map_data = None
+    st.session_state.start_addr = None
+    st.session_state.end_addr = None
 
+def build_map(start_addr, end_addr):
     start_coords = geocode_address(start_addr)
     end_coords = geocode_address(end_addr)
+    if not start_coords or not end_coords:
+        st.error("Invalid start or end location!")
+        return None
 
-    if start_coords and end_coords:
-        route_coords = get_route(start_coords, end_coords)
-        segments, charging_points = battery_route_segments(route_coords)
+    route_coords = get_route(start_coords, end_coords)
+    if not route_coords:
+        st.error("Unable to fetch route.")
+        return None
 
-        # ---------------------------
-        # Build map only once
-        # ---------------------------
-        m = folium.Map(location=route_coords[0], zoom_start=10)
-        folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
-        folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
+    segments, charging_points = battery_route_segments(route_coords)
 
-        # Draw route segments
-        for start, end, color in segments:
-            folium.PolyLine([start, end], color=color, weight=5).add_to(m)
+    m = folium.Map(location=route_coords[0], zoom_start=10)
+    folium.Marker(route_coords[0], popup="Start", icon=folium.Icon(color="green")).add_to(m)
+    folium.Marker(route_coords[-1], popup="Destination", icon=folium.Icon(color="red")).add_to(m)
 
-        # Suggested charging points
-        if charging_points:
-            marker_cluster = MarkerCluster().add_to(m)
-            for charger, eta in charging_points:
-                lat = charger["AddressInfo"]["Latitude"]
-                lon = charger["AddressInfo"]["Longitude"]
-                name = charger["AddressInfo"]["Title"]
-                folium.Marker(
-                    [lat, lon],
-                    popup=f"{name}\nETA: {eta.strftime('%H:%M')}",
-                    icon=folium.Icon(color="red", icon="bolt", prefix="fa")
-                ).add_to(marker_cluster)
+    for start, end, color in segments:
+        folium.PolyLine([start, end], color=color, weight=5).add_to(m)
 
-        # Nearby chargers
-        all_stations = get_charging_stations(
-            lat=(start_coords[0]+end_coords[0])/2,
-            lon=(start_coords[1]+end_coords[1])/2,
-            radius_m=50000,
-            maxresults=100
-        )
-        if all_stations:
-            marker_cluster = MarkerCluster().add_to(m)
-            for cs in all_stations:
-                lat = cs["AddressInfo"]["Latitude"]
-                lon = cs["AddressInfo"]["Longitude"]
-                name = cs["AddressInfo"]["Title"]
-                folium.Marker(
-                    [lat, lon],
-                    popup=name,
-                    icon=folium.Icon(color="orange", icon="flash", prefix="fa")
-                ).add_to(marker_cluster)
+    if charging_points:
+        cluster = MarkerCluster().add_to(m)
+        for charger, eta in charging_points:
+            lat = charger["AddressInfo"]["Latitude"]
+            lon = charger["AddressInfo"]["Longitude"]
+            name = charger["AddressInfo"]["Title"]
+            folium.Marker([lat, lon],
+                          popup=f"{name}\nETA: {eta.strftime('%H:%M')}",
+                          icon=folium.Icon(color="red", icon="bolt", prefix="fa")).add_to(cluster)
 
-        # Legend
-        legend_html = """
-        <div style="
-        position: fixed; 
-        bottom: 50px; left: 50px; width: 250px; height: 130px; 
-        border:2px solid grey; z-index:9999; font-size:14px;
-        background-color:white;
-        padding: 10px;
-        ">
-        <b>Legend</b><br>
-        <i style="color:green;">■</i>&nbsp;Sufficient Battery<br>
-        <i style="color:orange;">■</i>&nbsp;Low Battery Warning<br>
-        <i style="color:red;">■</i>&nbsp;Must Charge Now<br>
-        <i class="fa fa-bolt" style="color:red"></i>&nbsp;Suggested Charging Stop<br>
-        <i class="fa fa-plug" style="color:orange"></i>&nbsp;Other Chargers
-        </div>
-        """
-        m.get_root().html.add_child(folium.Element(legend_html))
+    # Add other nearby chargers
+    all_stations = get_charging_stations((start_coords[0]+end_coords[0])/2,
+                                         (start_coords[1]+end_coords[1])/2,
+                                         radius_m=50000, maxresults=100)
+    if all_stations:
+        cluster = MarkerCluster().add_to(m)
+        for cs in all_stations:
+            lat = cs["AddressInfo"]["Latitude"]
+            lon = cs["AddressInfo"]["Longitude"]
+            name = cs["AddressInfo"]["Title"]
+            folium.Marker([lat, lon], popup=name,
+                          icon=folium.Icon(color="orange", icon="flash", prefix="fa")).add_to(cluster)
 
-        # Save map in session_state to prevent disappearing
-        st.session_state.map_data = m
+    # Legend
+    legend_html = """
+    <div style="
+    position: fixed; 
+    bottom: 50px; left: 50px; width: 250px; height: 130px; 
+    border:2px solid grey; z-index:9999; font-size:14px;
+    background-color:white;
+    padding: 10px;">
+    <b>Legend</b><br>
+    <i style="color:green;">■</i>&nbsp;Sufficient Battery<br>
+    <i style="color:orange;">■</i>&nbsp;Low Battery Warning<br>
+    <i style="color:red;">■</i>&nbsp;Must Charge Now<br>
+    <i class="fa fa-bolt" style="color:red"></i>&nbsp;Suggested Charging Stop<br>
+    <i class="fa fa-plug" style="color:orange"></i>&nbsp;Other Chargers
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
 
+    return m
+
+# ---------------------------
+# Build map on button click only
+# ---------------------------
+if st.sidebar.button("Plan Trip") or st.session_state.map_data is None \
+        or st.session_state.start_addr != start_addr \
+        or st.session_state.end_addr != end_addr:
+
+    st.session_state.start_addr = start_addr
+    st.session_state.end_addr = end_addr
+    st.session_state.map_data = build_map(start_addr, end_addr)
+
+# ---------------------------
 # Display the map
-if "map_data" in st.session_state and st.session_state.map_data:
+# ---------------------------
+if st.session_state.map_data:
     st.subheader("EV Route with Smart Charging & ETA")
     st_folium(st.session_state.map_data, width=900, height=600)
+
